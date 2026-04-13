@@ -95,6 +95,11 @@ class Hyperparameters:
     grad_clip_norm: float = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
 
     out_dir: str = os.environ.get("OUT_DIR", "logs")
+    # Novel inventions (from 3-brain collaboration)
+    use_micro_norm: bool = bool(int(os.environ.get("USE_MICRO_NORM", "0")))
+    use_cpmr: bool = bool(int(os.environ.get("USE_CPMR", "0")))
+    cpmr_alpha: float = float(os.environ.get("CPMR_ALPHA", 0.1))
+    use_learnable_softcap: bool = bool(int(os.environ.get("USE_LEARNABLE_SOFTCAP", "0")))
 
     @property
     def train_files(self) -> str:
@@ -171,6 +176,33 @@ def accumulate_flat_grads(
 
 def rms_norm(x: mx.array, eps: float = 1e-6) -> mx.array:
     return (x * mx.rsqrt(mx.mean(x * x, axis=-1, keepdims=True) + eps)).astype(x.dtype)
+
+
+def micro_norm(x: mx.array, group_size: int = 64, eps: float = 1e-6) -> mx.array:
+    """Block-aligned RMSNorm matching int6 quantization group size.
+    Prevents activation outliers at the granularity that matters for quantization.
+    (Invention: Gemini, validated by 3-brain discussion)"""
+    shape = x.shape
+    D = shape[-1]
+    if D % group_size != 0:
+        return rms_norm(x, eps)  # fallback
+    x_grouped = x.reshape(*shape[:-1], D // group_size, group_size)
+    rms = mx.rsqrt(mx.mean(x_grouped * x_grouped, axis=-1, keepdims=True) + eps)
+    return (x_grouped * rms).reshape(shape).astype(x.dtype)
+
+
+def causal_prefix_mean(x: mx.array, alpha: float = 0.1) -> mx.array:
+    """Causal Prefix Mean Residual — inject running mean of all previous positions.
+    Gives every position a 'topic/context vector' for free.
+    (Invention: Codex, validated by 3-brain discussion)"""
+    xf = x.astype(mx.float32)
+    prefix_sum = mx.cumsum(xf, axis=1)
+    S = x.shape[1]
+    denom = mx.arange(1, S + 1, dtype=mx.float32).reshape(1, S, 1)
+    prefix_mean = prefix_sum / denom
+    # Shift right: position t sees only mean(x_{<t})
+    prev_mean = mx.concatenate([mx.zeros_like(prefix_mean[:, :1, :]), prefix_mean[:, :-1, :]], axis=1)
+    return x + alpha * rms_norm(prev_mean).astype(x.dtype)
 
 
 def zeropower_newtonschulz5(g: mx.array, steps: int, eps: float = 1e-7) -> mx.array:
@@ -287,8 +319,10 @@ class CastedLinear(nn.Module):
 
 
 class RMSNormNoWeight(nn.Module):
-    # MLX module wrapper around the functional RMSNorm helper so it composes nicely in blocks.
+    # MLX module wrapper. Uses MicroNorm if USE_MICRO_NORM=1.
     def __call__(self, x: mx.array) -> mx.array:
+        if int(os.environ.get("USE_MICRO_NORM", "0")):
+            return micro_norm(x)
         return rms_norm(x)
 
 
@@ -347,7 +381,8 @@ class MLP(nn.Module):
         self.proj = CastedLinear(hidden, dim)
 
     def __call__(self, x: mx.array) -> mx.array:
-        x = nn.relu(self.fc(x))
+        x = self.fc(x)
+        x = mx.where(x >= 0, x, 0.5 * x)  # LeakyReLU(0.5) — validated at -0.003 BPB in competition
         return self.proj(x * x)
 
 
@@ -419,14 +454,15 @@ class GPT(nn.Module):
         x = rms_norm(self.tok_emb(input_ids).astype(COMPUTE_DTYPE))
         x0 = x
         skips: list[mx.array] = []
+        use_cpmr = int(os.environ.get("USE_CPMR", "0"))
+        cpmr_alpha = float(os.environ.get("CPMR_ALPHA", "0.1"))
 
         for i in range(self.num_encoder_layers):
+            if use_cpmr and i < self.num_encoder_layers // 2:
+                x = causal_prefix_mean(x, alpha=cpmr_alpha)
             x = self.blocks[i](x, x0)
             skips.append(x)
         for i in range(self.num_decoder_layers):
-            # Odd layer counts have one more decoder block than encoder block. The baseline only
-            # applies a skip connection when one exists, then runs the remaining decoder block(s)
-            # without an added skip.
             if skips:
                 x = x + self.skip_weights[i].astype(x.dtype)[None, None, :] * skips.pop()
             x = self.blocks[self.num_encoder_layers + i](x, x0)
