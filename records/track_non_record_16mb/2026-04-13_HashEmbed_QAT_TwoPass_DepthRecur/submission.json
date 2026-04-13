@@ -1,0 +1,9 @@
+{
+  "name": "Hash-Gated Additive Embeddings + QAT + Two-Pass Latent Compression + Depth Recurrence",
+  "author": "seekerPrice",
+  "github_id": "seekerPrice",
+  "val_bpb": 2.4264,
+  "date": "2026-04-13",
+  "track": "non_record_16mb",
+  "notes": "MLX results (300 steps, SP1024). H100 validation pending — applying for compute credits. Novel zero-overhead innovations designed via 3-AI research collaboration."
+}
