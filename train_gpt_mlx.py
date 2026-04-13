@@ -65,6 +65,7 @@ class Hyperparameters:
     mlx_eager_eval: bool = bool(int(os.environ.get("MLX_EAGER_EVAL", "1")))
     warmup_steps: int = int(os.environ.get("WARMUP_STEPS", 20))
     warmdown_iters: int = int(os.environ.get("WARMDOWN_ITERS", 1200))
+    warmdown_kind: str = os.environ.get("WARMDOWN_KIND", "cosine").lower()
     max_wallclock_seconds: float = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
 
     # Model (defaults match the current baseline setup).
@@ -114,15 +115,29 @@ class Hyperparameters:
         return self.train_batch_tokens // self.grad_accum_steps
 
     def lr_mul(self, step: int, elapsed_ms: float) -> float:
+        def warmdown_curve(t: float) -> float:
+            t = min(max(t, 0.0), 1.0)
+            if self.warmdown_kind == "sqrt":
+                return math.sqrt(1.0 - t)
+            if self.warmdown_kind == "cosine":
+                return 0.5 * (1.0 + math.cos(math.pi * t))
+            return 1.0 - t
+
         if self.warmdown_iters <= 0:
             return 1.0
         if self.max_wallclock_seconds <= 0:
             warmdown_start = max(self.iterations - self.warmdown_iters, 0)
-            return max((self.iterations - step) / max(self.warmdown_iters, 1), 0.0) if warmdown_start <= step < self.iterations else 1.0
+            if step < warmdown_start:
+                return 1.0
+            t = (step - warmdown_start) / max(self.warmdown_iters, 1)
+            return warmdown_curve(t)
         step_ms = elapsed_ms / max(step, 1)
         warmdown_ms = self.warmdown_iters * step_ms
         remaining_ms = max(1000.0 * self.max_wallclock_seconds - elapsed_ms, 0.0)
-        return remaining_ms / max(warmdown_ms, 1e-9) if remaining_ms <= warmdown_ms else 1.0
+        if remaining_ms > warmdown_ms:
+            return 1.0
+        t = 1.0 - remaining_ms / max(warmdown_ms, 1e-9)
+        return warmdown_curve(t)
 
 
 CONTROL_TENSOR_NAME_PATTERNS = tuple(
@@ -178,17 +193,10 @@ def rms_norm(x: mx.array, eps: float = 1e-6) -> mx.array:
     return (x * mx.rsqrt(mx.mean(x * x, axis=-1, keepdims=True) + eps)).astype(x.dtype)
 
 
-def micro_norm(x: mx.array, group_size: int = 64, eps: float = 1e-6) -> mx.array:
-    """Block-aligned RMSNorm matching int6 quantization group size.
-    Prevents activation outliers at the granularity that matters for quantization.
-    (Invention: Gemini, validated by 3-brain discussion)"""
-    shape = x.shape
-    D = shape[-1]
-    if D % group_size != 0:
-        return rms_norm(x, eps)  # fallback
-    x_grouped = x.reshape(*shape[:-1], D // group_size, group_size)
-    rms = mx.rsqrt(mx.mean(x_grouped * x_grouped, axis=-1, keepdims=True) + eps)
-    return (x_grouped * rms).reshape(shape).astype(x.dtype)
+def micro_norm(x: mx.array, eps: float = 1e-6) -> mx.array:
+    """Normalize each feature vector to unit L2 norm without learned parameters."""
+    inv_norm = mx.rsqrt(mx.sum(x * x, axis=-1, keepdims=True) + eps)
+    return (x * inv_norm).astype(x.dtype)
 
 
 def causal_prefix_mean(x: mx.array, alpha: float = 0.1) -> mx.array:
@@ -355,6 +363,9 @@ class CausalSelfAttention(nn.Module):
         self.c_v = CastedLinear(dim, kv_dim)
         self.proj = CastedLinear(dim, dim)
         self.q_gain = mx.ones((num_heads,), dtype=mx.float32) * qk_gain_init
+        # Dichotomous Temperature: per-head learned sharpness (fused into q_gain before export)
+        # (Invention: Gemini, neuroscience-inspired)
+        self.head_temp = mx.ones((num_heads,), dtype=mx.float32)
         self.rope = nn.RoPE(self.head_dim, traditional=False, base=rope_base)
         self.scale = self.head_dim ** -0.5
 
@@ -367,6 +378,7 @@ class CausalSelfAttention(nn.Module):
         q = self.rope(rms_norm(q).astype(COMPUTE_DTYPE))
         k = self.rope(rms_norm(k).astype(COMPUTE_DTYPE))
         q = q * self.q_gain.astype(q.dtype)[None, :, None, None]
+        q = q * self.head_temp.astype(q.dtype)[None, :, None, None]
         y = mx.fast.scaled_dot_product_attention(q, k, v, scale=self.scale, mask="causal")
         y = y.transpose(0, 2, 1, 3).reshape(bsz, seqlen, dim)
         return self.proj(y)
@@ -512,7 +524,10 @@ class Muon:
             buf = momentum * self.buffers[k] + g
             self.buffers[k] = buf
             g_eff = g + momentum * buf
-            g_ortho = zeropower_newtonschulz5(g_eff, self.args.muon_backend_steps)
+            ns_steps = self.args.muon_backend_steps
+            if ns_steps > 3 and p.ndim == 2 and max(p.shape) / min(p.shape) >= 2.0:
+                ns_steps = 3
+            g_ortho = zeropower_newtonschulz5(g_eff, ns_steps)
             scale = math.sqrt(max(1.0, float(p.shape[0]) / float(p.shape[1])))
             out[k] = p - lr * (g_ortho * scale).astype(p.dtype)
         return out
@@ -556,6 +571,17 @@ class SplitOptimizers:
         params = dict(tree_flatten(model.parameters()))
         grads = dict(tree_flatten(grads_tree))
         updated = dict(params)
+
+        # NEKP: Nash Kurtosis Penalty — penalize outlier weights for better int6 quantization
+        # (Invention: Gemini, game theory + physics cross-domain)
+        if int(os.environ.get("USE_NEKP", "0")):
+            nekp_lambda = float(os.environ.get("NEKP_LAMBDA", "1e-3"))
+            for k in self.matrix_keys:
+                if k in grads and k in params:
+                    p = params[k]
+                    row_rms = mx.sqrt(mx.mean(p * p, axis=-1, keepdims=True) + 1e-6)
+                    outlier_mask = (mx.abs(p) > (2.0 * row_rms)).astype(p.dtype)
+                    grads[k] = grads[k] + nekp_lambda * p * outlier_mask
 
         updated.update(self.muon.step(params, grads, step=step, lr_mul=lr_mul))
 
