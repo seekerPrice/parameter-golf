@@ -193,10 +193,17 @@ def rms_norm(x: mx.array, eps: float = 1e-6) -> mx.array:
     return (x * mx.rsqrt(mx.mean(x * x, axis=-1, keepdims=True) + eps)).astype(x.dtype)
 
 
-def micro_norm(x: mx.array, eps: float = 1e-6) -> mx.array:
-    """Normalize each feature vector to unit L2 norm without learned parameters."""
-    inv_norm = mx.rsqrt(mx.sum(x * x, axis=-1, keepdims=True) + eps)
-    return (x * inv_norm).astype(x.dtype)
+def micro_norm(x: mx.array, group_size: int = 64, eps: float = 1e-6) -> mx.array:
+    """Block-aligned RMSNorm matching int6 quantization group size.
+    Uses mean (not sum) to preserve activation scale — critical difference from L2 norm.
+    (Fixed based on Gemini's diagnosis: L2 norm made activations 22x smaller)"""
+    shape = x.shape
+    D = shape[-1]
+    if D % group_size != 0:
+        return rms_norm(x, eps)
+    x_grouped = x.reshape(*shape[:-1], D // group_size, group_size)
+    rms = mx.rsqrt(mx.mean(x_grouped * x_grouped, axis=-1, keepdims=True) + eps)
+    return (x_grouped * rms).reshape(shape).astype(x.dtype)
 
 
 def causal_prefix_mean(x: mx.array, alpha: float = 0.1) -> mx.array:
@@ -462,11 +469,14 @@ class GPT(nn.Module):
         c = self.logit_softcap
         return c * mx.tanh(logits / c)
 
+    # Progressive Invention Scheduling: disable inventions during warmdown
+    inventions_active = True  # Set to False during warmdown by training loop
+
     def __call__(self, input_ids: mx.array) -> mx.array:
         x = rms_norm(self.tok_emb(input_ids).astype(COMPUTE_DTYPE))
         x0 = x
         skips: list[mx.array] = []
-        use_cpmr = int(os.environ.get("USE_CPMR", "0"))
+        use_cpmr = int(os.environ.get("USE_CPMR", "0")) and self.inventions_active
         cpmr_alpha = float(os.environ.get("CPMR_ALPHA", "0.1"))
 
         for i in range(self.num_encoder_layers):
@@ -574,13 +584,14 @@ class SplitOptimizers:
 
         # NEKP: Nash Kurtosis Penalty — penalize outlier weights for better int6 quantization
         # (Invention: Gemini, game theory + physics cross-domain)
-        if int(os.environ.get("USE_NEKP", "0")):
+        # Progressive scheduling: disabled during warmdown
+        if int(os.environ.get("USE_NEKP", "0")) and getattr(model, 'inventions_active', True):
             nekp_lambda = float(os.environ.get("NEKP_LAMBDA", "1e-3"))
             for k in self.matrix_keys:
                 if k in grads and k in params:
                     p = params[k]
                     row_rms = mx.sqrt(mx.mean(p * p, axis=-1, keepdims=True) + 1e-6)
-                    outlier_mask = (mx.abs(p) > (2.0 * row_rms)).astype(p.dtype)
+                    outlier_mask = (mx.abs(p) > (3.0 * row_rms)).astype(p.dtype)  # 3σ: only 0.3% of weights
                     grads[k] = grads[k] + nekp_lambda * p * outlier_mask
 
         updated.update(self.muon.step(params, grads, step=step, lr_mul=lr_mul))
@@ -1110,6 +1121,11 @@ def main() -> None:
         approx_train_time_ms = train_time_ms + 1000.0 * (time.perf_counter() - t0)
         tok_s = args.train_batch_tokens / (step_ms / 1000.0)
         step += 1
+        # Progressive Invention Scheduling: disable inventions during warmdown
+        warmdown_start_step = max(args.iterations - args.warmdown_iters, 0)
+        if step == warmdown_start_step and model.inventions_active:
+            model.inventions_active = False
+            log(f"inventions:disabled at step:{step} (warmdown phase)")
         if args.train_log_every > 0 and (step <= 10 or step % args.train_log_every == 0 or stop_after_step is not None):
             log(
                 f"step:{step}/{args.iterations} train_loss:{train_loss_value:.4f} "
